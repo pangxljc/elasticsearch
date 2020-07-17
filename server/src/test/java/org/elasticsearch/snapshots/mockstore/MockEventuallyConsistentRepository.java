@@ -20,24 +20,26 @@
 package org.elasticsearch.snapshots.mockstore;
 
 import org.apache.lucene.codecs.CodecUtil;
-import org.elasticsearch.cluster.metadata.RepositoryMetaData;
+import org.elasticsearch.cluster.metadata.RepositoryMetadata;
+import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.blobstore.BlobContainer;
-import org.elasticsearch.common.blobstore.BlobMetaData;
+import org.elasticsearch.common.blobstore.BlobMetadata;
 import org.elasticsearch.common.blobstore.BlobPath;
 import org.elasticsearch.common.blobstore.BlobStore;
 import org.elasticsearch.common.blobstore.DeleteResult;
-import org.elasticsearch.common.blobstore.support.PlainBlobMetaData;
+import org.elasticsearch.common.blobstore.support.PlainBlobMetadata;
 import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.io.Streams;
 import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
 import org.elasticsearch.common.xcontent.NamedXContentRegistry;
 import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.indices.recovery.RecoverySettings;
 import org.elasticsearch.repositories.blobstore.BlobStoreRepository;
 import org.elasticsearch.snapshots.SnapshotInfo;
 import org.elasticsearch.test.ESTestCase;
-import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -47,6 +49,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
@@ -64,18 +67,23 @@ import static org.hamcrest.Matchers.equalTo;
  */
 public class MockEventuallyConsistentRepository extends BlobStoreRepository {
 
+    private final Random random;
+
     private final Context context;
 
     private final NamedXContentRegistry namedXContentRegistry;
 
     public MockEventuallyConsistentRepository(
-        final RepositoryMetaData metadata,
+        final RepositoryMetadata metadata,
         final NamedXContentRegistry namedXContentRegistry,
-        final ThreadPool threadPool,
-        final Context context) {
-        super(metadata, namedXContentRegistry, threadPool, BlobPath.cleanPath());
+        final ClusterService clusterService,
+        final RecoverySettings recoverySettings,
+        final Context context,
+        final Random random) {
+        super(metadata, namedXContentRegistry, clusterService, recoverySettings, BlobPath.cleanPath());
         this.context = context;
         this.namedXContentRegistry = namedXContentRegistry;
+        this.random = random;
     }
 
     // Filters out all actions that are super-seeded by subsequent actions
@@ -107,6 +115,9 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
      */
     public static final class Context {
 
+        // Eventual consistency is only simulated as long as this flag is false
+        private boolean consistent;
+
         private final List<BlobStoreAction> actions = new ArrayList<>();
 
         /**
@@ -117,6 +128,7 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
                 final List<BlobStoreAction> consistentActions = consistentView(actions);
                 actions.clear();
                 actions.addAll(consistentActions);
+                consistent = true;
             }
         }
     }
@@ -179,6 +191,16 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
             }
 
             @Override
+            public boolean blobExists(String blobName) {
+                try {
+                    readBlob(blobName);
+                    return true;
+                } catch (NoSuchFileException ignored) {
+                    return false;
+                }
+            }
+
+            @Override
             public InputStream readBlob(String name) throws NoSuchFileException {
                 ensureNotClosed();
                 final String blobPath = path.buildAsString() + name;
@@ -196,6 +218,15 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
                 }
             }
 
+            @Override
+            public InputStream readBlob(String blobName, long position, long length) throws IOException {
+                final InputStream stream = readBlob(blobName);
+                if (position > 0) {
+                    stream.skip(position);
+                }
+                return Streams.limitStream(stream, length);
+            }
+
             private List<BlobStoreAction> relevantActions(String blobPath) {
                 assert Thread.holdsLock(context.actions);
                 final List<BlobStoreAction> relevantActions = new ArrayList<>(
@@ -211,10 +242,12 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
             }
 
             @Override
-            public void deleteBlob(String blobName) {
+            public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) {
                 ensureNotClosed();
                 synchronized (context.actions) {
-                    context.actions.add(new BlobStoreAction(Operation.DELETE, path.buildAsString() + blobName));
+                    for (String blobName : blobNames) {
+                        context.actions.add(new BlobStoreAction(Operation.DELETE, path.buildAsString() + blobName));
+                    }
                 }
             }
 
@@ -236,18 +269,18 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
             }
 
             @Override
-            public Map<String, BlobMetaData> listBlobs() {
+            public Map<String, BlobMetadata> listBlobs() {
                 ensureNotClosed();
                 final String thisPath = path.buildAsString();
                 synchronized (context.actions) {
-                    return consistentView(context.actions).stream()
+                    return maybeMissLatestIndexN(consistentView(context.actions).stream()
                         .filter(
                             action -> action.path.startsWith(thisPath) && action.path.substring(thisPath.length()).indexOf('/') == -1
                                 && action.operation == Operation.PUT)
                         .collect(
                             Collectors.toMap(
                                 action -> action.path.substring(thisPath.length()),
-                                action -> new PlainBlobMetaData(action.path.substring(thisPath.length()), action.data.length)));
+                                action -> new PlainBlobMetadata(action.path.substring(thisPath.length()), action.data.length))));
                 }
             }
 
@@ -267,10 +300,22 @@ public class MockEventuallyConsistentRepository extends BlobStoreRepository {
             }
 
             @Override
-            public Map<String, BlobMetaData> listBlobsByPrefix(String blobNamePrefix) {
-                return Maps.ofEntries(
-                    listBlobs().entrySet().stream().filter(entry -> entry.getKey().startsWith(blobNamePrefix)).collect(Collectors.toList())
-                );
+            public Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) {
+                return maybeMissLatestIndexN(
+                    Maps.ofEntries(listBlobs().entrySet().stream().filter(entry -> entry.getKey().startsWith(blobNamePrefix))
+                        .collect(Collectors.toList())));
+            }
+
+            // Randomly filter out the index-N blobs from a listing to test that tracking of it in latestKnownRepoGen and the cluster state
+            // ensures consistent repository operations
+            private Map<String, BlobMetadata> maybeMissLatestIndexN(Map<String, BlobMetadata> listing) {
+                // Randomly filter out index-N blobs at the repo root to proof that we don't need them to be consistently listed
+                if (path.parent() == null && context.consistent == false) {
+                    final Map<String, BlobMetadata> filtered = new HashMap<>(listing);
+                    filtered.keySet().removeIf(b -> b.startsWith(BlobStoreRepository.INDEX_FILE_PREFIX) && random.nextBoolean());
+                    return Map.copyOf(filtered);
+                }
+                return listing;
             }
 
             @Override

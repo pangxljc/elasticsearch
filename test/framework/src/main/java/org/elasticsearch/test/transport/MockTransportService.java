@@ -48,7 +48,7 @@ import org.elasticsearch.test.ESTestCase;
 import org.elasticsearch.test.tasks.MockTaskManager;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.ConnectTransportException;
-import org.elasticsearch.transport.ConnectionManager;
+import org.elasticsearch.transport.ClusterConnectionManager;
 import org.elasticsearch.transport.ConnectionProfile;
 import org.elasticsearch.transport.RequestHandlerRegistry;
 import org.elasticsearch.transport.Transport;
@@ -92,6 +92,8 @@ public final class MockTransportService extends TransportService {
 
     private final Map<DiscoveryNode, List<Transport.Connection>> openConnections = new HashMap<>();
 
+    private final List<Runnable> onStopListeners = new CopyOnWriteArrayList<>();
+
     public static class TestPlugin extends Plugin {
         @Override
         public List<Setting<?>> getSettings() {
@@ -118,7 +120,13 @@ public final class MockTransportService extends TransportService {
 
     public static MockTransportService createNewService(Settings settings, Transport transport, Version version, ThreadPool threadPool,
                                                         @Nullable ClusterSettings clusterSettings, Set<String> taskHeaders) {
-        return new MockTransportService(settings, transport, threadPool, TransportService.NOOP_TRANSPORT_INTERCEPTOR,
+        return createNewService(settings, transport, version, threadPool, clusterSettings, taskHeaders, NOOP_TRANSPORT_INTERCEPTOR);
+    }
+
+    public static MockTransportService createNewService(Settings settings, Transport transport, Version version, ThreadPool threadPool,
+                                                        @Nullable ClusterSettings clusterSettings, Set<String> taskHeaders,
+                                                        TransportInterceptor interceptor) {
+        return new MockTransportService(settings, transport, threadPool, interceptor,
             boundAddress ->
                 new DiscoveryNode(Node.NODE_NAME_SETTING.get(settings), UUIDs.randomBase64UUID(), boundAddress.publishAddress(),
                     Node.NODE_ATTRIBUTES.getAsMap(settings), DiscoveryNode.getRolesFromSettings(settings), version),
@@ -158,7 +166,7 @@ public final class MockTransportService extends TransportService {
                                  Function<BoundTransportAddress, DiscoveryNode> localNodeFactory,
                                  @Nullable ClusterSettings clusterSettings, Set<String> taskHeaders) {
         super(settings, transport, threadPool, interceptor, localNodeFactory, clusterSettings, taskHeaders,
-            new StubbableConnectionManager(new ConnectionManager(settings, transport), settings, transport));
+            new StubbableConnectionManager(new ClusterConnectionManager(settings, transport)));
         this.original = transport.getDelegate();
     }
 
@@ -188,19 +196,26 @@ public final class MockTransportService extends TransportService {
     }
 
     /**
-     * Clears the rule associated with the provided delegate service.
+     * Clears all the inbound rules.
      */
-    public void clearRule(TransportService transportService) {
+    public void clearInboundRules() {
+        transport().clearInboundBehaviors();
+    }
+
+    /**
+     * Clears the outbound rules associated with the provided delegate service.
+     */
+    public void clearOutboundRules(TransportService transportService) {
         for (TransportAddress transportAddress : extractTransportAddresses(transportService)) {
-            clearRule(transportAddress);
+            clearOutboundRules(transportAddress);
         }
     }
 
     /**
-     * Clears the rule associated with the provided delegate address.
+     * Clears the outbound rules associated with the provided delegate address.
      */
-    public void clearRule(TransportAddress transportAddress) {
-        transport().clearBehavior(transportAddress);
+    public void clearOutboundRules(TransportAddress transportAddress) {
+        transport().clearOutboundBehaviors(transportAddress);
         connectionManager().clearBehavior(transportAddress);
     }
 
@@ -408,6 +423,15 @@ public final class MockTransportService extends TransportService {
     }
 
     /**
+     * Adds a new handling behavior that is used when the defined request is received.
+     *
+     */
+    public <R extends TransportRequest> void addRequestHandlingBehavior(String actionName,
+                                                                        StubbableTransport.RequestHandlingBehavior<R> handlingBehavior) {
+        transport().addRequestHandlingBehavior(actionName, handlingBehavior);
+    }
+
+    /**
      * Adds a new send behavior that is used for communication with the given delegate service.
      *
      * @return {@code true} if no other send behavior was registered for any of the addresses bound by delegate service.
@@ -525,6 +549,16 @@ public final class MockTransportService extends TransportService {
             }
             l.onResponse(connection);
         }));
+    }
+
+    public void addOnStopListener(Runnable listener) {
+        onStopListeners.add(listener);
+    }
+
+    @Override
+    protected void doStop() {
+        onStopListeners.forEach(Runnable::run);
+        super.doStop();
     }
 
     @Override

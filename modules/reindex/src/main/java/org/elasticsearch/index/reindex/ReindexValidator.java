@@ -32,12 +32,17 @@ import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.logging.DeprecationLogger;
 import org.elasticsearch.common.regex.Regex;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.search.builder.SearchSourceBuilder;
 
 import java.util.List;
 
 class ReindexValidator {
+    private static final DeprecationLogger deprecationLogger = DeprecationLogger.getLogger(ReindexValidator.class);
+    static final String SORT_DEPRECATED_MESSAGE = "The sort option in reindex is deprecated. " +
+        "Instead consider using query filtering to find the desired subset of data.";
 
     private final CharacterRunAutomaton remoteWhitelist;
     private final ClusterService clusterService;
@@ -57,6 +62,10 @@ class ReindexValidator {
         ClusterState state = clusterService.state();
         validateAgainstAliases(request.getSearchRequest(), request.getDestination(), request.getRemoteInfo(), resolver, autoCreateIndex,
             state);
+        SearchSourceBuilder searchSource = request.getSearchRequest().source();
+        if (searchSource != null && searchSource.sorts() != null && searchSource.sorts().isEmpty() == false) {
+            deprecationLogger.deprecate("reindex_sort", SORT_DEPRECATED_MESSAGE);
+        }
     }
 
     static void checkRemoteWhitelist(CharacterRunAutomaton whitelist, RemoteInfo remoteInfo) {

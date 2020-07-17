@@ -26,7 +26,6 @@ import org.elasticsearch.common.xcontent.ToXContentFragment;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentParser;
 import org.elasticsearch.index.get.GetResult;
-import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.search.SearchHit;
 
 import java.io.IOException;
@@ -73,11 +72,12 @@ public class DocumentField implements Writeable, ToXContentFragment, Iterable<Ob
     /**
      * The first value of the hit.
      */
+    @SuppressWarnings("unchecked")
     public <V> V getValue() {
         if (values == null || values.isEmpty()) {
             return null;
         }
-        return (V)values.get(0);
+        return (V) values.get(0);
     }
 
     /**
@@ -85,13 +85,6 @@ public class DocumentField implements Writeable, ToXContentFragment, Iterable<Ob
      */
     public List<Object> getValues() {
         return values;
-    }
-
-    /**
-     * @return The field is a metadata field
-     */
-    public boolean isMetadataField() {
-        return MapperService.isMetadataField(name);
     }
 
     @Override
